@@ -5,6 +5,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stdarg.h>
 
 #include "pigeon_string.h"
 #include "pigeon_memory.h"
@@ -71,12 +72,49 @@ typedef struct {
     pigeon_message_size_t msg_size;
     pigeon_message_size_t remaining;
 
-    int line_number;
+    unsigned line_number;
     const char * line_start;
+
+    char error_messages[256];
 } pigeon_parse_context_t;
 
-static const char encoding_str_sha256[] = "sha256:";
-static const char encoding_str_ed25519[] = "ed25519:";
+static const char encoding_str_sha256[] = "sha256";
+static const char encoding_str_ed25519[] = "ed25519";
+
+const char * pigeon_get_error_messages(const pigeon_parse_context_t * restrict ctx)
+{
+    return ctx->error_messages;
+}
+
+static void pigeon_parse_error(pigeon_parse_context_t * restrict ctx, const char * format, ...)
+{
+    int remaining = sizeof(ctx->error_messages);
+    remaining -= snprintf(ctx->error_messages, sizeof(ctx->error_messages), "Error, line %u: ", ctx->line_number);
+
+    va_list ap;
+    va_start(ap, format);
+    remaining -= vsnprintf(ctx->error_messages + sizeof(ctx->error_messages) - remaining, remaining, format, ap);
+    va_end(ap);
+
+    if (remaining < 2)
+        remaining = 2;
+
+    memcpy(&ctx->error_messages[sizeof(ctx->error_messages) - remaining], "\n", 2);
+}
+
+static const char * pigeon_make_temp_str_range(const char * restrict start, const char * end)
+{
+    static char buffer[256];
+
+    unsigned size = end - start;
+    if (size >= sizeof(buffer) - 1)
+        size = sizeof(buffer) - 1;
+
+    memcpy(buffer, start, size);
+    buffer[size] = '\0';
+
+    return buffer;
+}
 
 static void pigeon_free_encoded_value(pigeon_encoded_value_t * restrict value)
 {
@@ -86,8 +124,10 @@ static void pigeon_free_encoded_value(pigeon_encoded_value_t * restrict value)
 
 static inline void pigeon_init_field(pigeon_field_t * restrict field)
 {
+    field->elem.next = NULL;
     field->field_name = NULL;
     field->field_type = PIGEON_FIELD_EMPTY;
+    memset(&field->field_value, 0, sizeof(field->field_value));
 }
 
 static void pigeon_free_field(pigeon_field_t * restrict field)
@@ -202,34 +242,50 @@ static bool pigeon_parse_encoded_value(pigeon_parse_context_t * restrict ctx, pi
     if (ctx->remaining == 0)
         false;
 
-    const char * restrict pos = ctx->msg_pos;
-    const char * restrict end = ctx->msg_pos + ctx->remaining;
+    const char * algo_spec_start = ctx->msg_pos;
+    const char * pos = ctx->msg_pos;
+    const char * end = ctx->msg_pos + ctx->remaining;
 
     for (; pos != end; ++pos)
     {
-        if (*pos == ':')
+        if (!isalnum(*pos))
             break;
-        else if (isspace(*pos) || !isprint(*pos))
-            return false;
     }
 
-    if (pos == end)
-        return false;
-
-    ++pos;
-    pigeon_message_size_t spec_size = pos - ctx->msg_pos;
-    if (0 == pigeon_safe_memcmp(ctx->msg_pos, spec_size, encoding_str_sha256, sizeof(encoding_str_sha256) - 1))
-        decoded->encoding_type = PIGEON_ENCODING_TYPE_SHA256;
-    else if (0 == pigeon_safe_memcmp(ctx->msg_pos, spec_size, encoding_str_ed25519, sizeof(encoding_str_ed25519) - 1))
-        decoded->encoding_type = PIGEON_ENCODING_TYPE_ED25519;
-    else
-        return false;
-
-    if (pos == end)
-        return false;
+    const char * algo_spec_end = pos;
 
     pigeon_move_to(ctx, pos);
+    pigeon_skip_ws(ctx);
 
+    if (ctx->remaining == 0)
+    {
+        pigeon_parse_error(ctx, "unexpected EOF");
+        return false;
+    }
+    else if (*ctx->msg_pos != ':')
+    {
+        pigeon_parse_error(ctx, "expected ':' after algorithm specifier");
+        return false;
+    }
+
+    pigeon_message_size_t spec_size = algo_spec_end - algo_spec_start;
+    if (0 == pigeon_safe_memcmp(algo_spec_start, spec_size, encoding_str_sha256, sizeof(encoding_str_sha256) - 1))
+        decoded->encoding_type = PIGEON_ENCODING_TYPE_SHA256;
+    else if (0 == pigeon_safe_memcmp(algo_spec_start, spec_size, encoding_str_ed25519, sizeof(encoding_str_ed25519) - 1))
+        decoded->encoding_type = PIGEON_ENCODING_TYPE_ED25519;
+    else
+    {
+        pigeon_parse_error(ctx, "unknown algorithm specified '%s'", pigeon_make_temp_str_range(algo_spec_start, algo_spec_end));
+        return false;
+    }
+
+    pigeon_advance_pos(ctx, 1);
+    pigeon_skip_ws(ctx);
+
+    if (ctx->remaining == 0)
+        return false;
+
+    pos = ctx->msg_pos;
     const char * hash_end = pigeon_scan_base64(ctx);
     decoded->hash = pigeon_strdup_range(pos, hash_end - pos);
 
@@ -307,13 +363,15 @@ static bool pigeon_parse_field_value(pigeon_parse_context_t * restrict ctx, pige
     if (ctx->remaining == 0)
         return false;
 
-    switch (*ctx->msg_pos)
+    char ch = *ctx->msg_pos;
+    switch (ch)
     {
         case '@':
         case '&':
         case '%':
-            field->field_type = pigeon_deduce_field_type(*ctx->msg_pos);
             pigeon_advance_pos(ctx, 1);
+            pigeon_skip_ws(ctx);
+            field->field_type = pigeon_deduce_field_type(ch);
             return pigeon_parse_encoded_value(ctx, &field->field_value.encoded);
 
         case '"':
@@ -559,54 +617,54 @@ error:
     return false;
 }
 
-bool pigeon_parse_message(const char * restrict msg_data, pigeon_message_size_t msg_size, pigeon_parsed_message_t * restrict decoded_msg)
+bool pigeon_parse_message(pigeon_parse_context_t * restrict ctx, const char * restrict msg_data, pigeon_message_size_t msg_size, pigeon_parsed_message_t * restrict decoded_msg)
 {
+    memset(ctx, 0, sizeof(ctx));
     memset(decoded_msg, 0, sizeof(*decoded_msg));
 
-    pigeon_parse_context_t ctx;
-    ctx.msg_data = msg_data;
-    ctx.msg_size = msg_size;
-    ctx.msg_pos = msg_data;
-    ctx.remaining = msg_size;
-    ctx.line_number = 1;
-    ctx.line_start = msg_data;
+    ctx->msg_data = msg_data;
+    ctx->msg_size = msg_size;
+    ctx->msg_pos = msg_data;
+    ctx->remaining = msg_size;
+    ctx->line_number = 1;
+    ctx->line_start = msg_data;
 
-    while (ctx.remaining > 0)
+    while (ctx->remaining > 0)
     {
-        pigeon_skip_ws(&ctx);
-        if (*ctx.msg_pos == '\n')
+        pigeon_skip_ws(ctx);
+        if (*ctx->msg_pos == '\n')
             break;
-        else if (!pigeon_parse_header(&ctx, decoded_msg))
+        else if (!pigeon_parse_header(ctx, decoded_msg))
             goto error;
     }
 
-    if (ctx.remaining == 0)
+    if (ctx->remaining == 0)
         goto error; // unexpected EOF
-    else if (*ctx.msg_pos != '\n')
+    else if (*ctx->msg_pos != '\n')
         goto error; // expected blank line
 
-    ++ctx.line_number;
-    pigeon_advance_pos(&ctx, 1);
+    ++ctx->line_number;
+    pigeon_advance_pos(ctx, 1);
 
-    if (ctx.remaining == 0)
+    if (ctx->remaining == 0)
         goto error; // unexpected EOF
     
     pigeon_list_init(&decoded_msg->fields);
-    if (!pigeon_parse_data_fields(&ctx, &decoded_msg->fields))
+    if (!pigeon_parse_data_fields(ctx, &decoded_msg->fields))
         goto error;
 
-    if (ctx.remaining == 0)
+    if (ctx->remaining == 0)
         goto error; // unexpected EOF
-    else if (*ctx.msg_pos != '\n')
+    else if (*ctx->msg_pos != '\n')
         goto error; // expected blank line
 
-    ++ctx.line_number;
-    pigeon_advance_pos(&ctx, 1);
+    ++ctx->line_number;
+    pigeon_advance_pos(ctx, 1);
 
-    if (!pigeon_parse_footer(&ctx, decoded_msg))
+    if (!pigeon_parse_footer(ctx, decoded_msg))
         goto error;
 
-    if (ctx.remaining > 0)
+    if (ctx->remaining > 0)
         goto error;  // extra data at end
 
     return true;
@@ -658,10 +716,15 @@ static const char* format_encoded_value(const pigeon_encoded_value_t * restrict 
 
 int main(void)
 {
+    pigeon_parse_context_t ctx;
     pigeon_parsed_message_t message;
-    if (!pigeon_parse_message(test_message, sizeof(test_message) - 1, &message))
+    if (!pigeon_parse_message(&ctx, test_message, sizeof(test_message) - 1, &message))
     {
-        puts("Parsing failed\n");
+        const char * msgs = pigeon_get_error_messages(&ctx);
+        if (*msgs)
+            puts(msgs);
+        else
+            puts("Parsing failed\n");
         return 1;
     }
 
