@@ -138,43 +138,11 @@ static inline bool pigeon_is_prefix(pigeon_parse_context_t * restrict ctx, const
     ctx->remaining > prefix_length && 0 == strncmp(ctx->msg_pos, prefix, prefix_length);
 }
 
-static inline char * pigeon_find_eol(pigeon_parse_context_t * ctx)
-{
-    return memchr(ctx->msg_pos, '\n', ctx->remaining);
-}
-
-// static bool pigeon_parse_sha256(pigeon_parse_context_t * restrict ctx, unsigned char * restrict hash_value, pigeon_message_size_t hash_size)
-// {
-//     const char * end = pigeon_find_eol(ctx);
-//     if (!end)
-//         return false;
-
-//     size_t bin_len;
-//     int rc = sodium_base642bin(hash_value, hash_size, ctx->msg_pos, end - ctx->msg_pos, "", &bin_len, NULL, sodium_base64_VARIANT_URLSAFE);
-//     return rc == 0 && bin_len == crypto_hash_sha256_BYTES;
-// }
-
-// static bool pigeon_parse_ed25519(pigeon_parse_context_t * restrict ctx, unsigned char * restrict hash_value, pigeon_message_size_t hash_size)
-// {
-//     const char * end = memchr(ctx->msg_pos, '\n', ctx->remaining);
-//     if (!end)
-//         return false;
-
-//     size_t bin_len;
-//     int rc = sodium_base642bin(hash_value, hash_size, ctx->msg_pos, end - ctx->msg_pos, "", &bin_len, NULL, sodium_base64_VARIANT_URLSAFE);
-//     return rc == 0 && bin_len == crypto_sign_ed25519_PUBLICKEYBYTES;
-// }
-
 static inline int pigeon_safe_memcmp(const char * restrict lhs, size_t lhs_size, const char * restrict rhs, size_t rhs_size)
 {
     size_t min_size = lhs_size <= rhs_size ? lhs_size : rhs_size;
     int cmp = memcmp(lhs, rhs, min_size);
     return cmp != 0 ? cmp : lhs_size - rhs_size;
-}
-
-static inline bool pigeon_token_matches(const pigeon_token_t * restrict token, const char *str, size_t str_size)
-{
-    return 0 == pigeon_safe_memcmp(token->token_start, token->token_length, str, str_size);
 }
 
 static inline bool pigeon_isbase64(char ch)
@@ -220,29 +188,6 @@ static pigeon_message_size_t pigeon_skip_ws(pigeon_parse_context_t * restrict ct
     return skipped_bytes;
 }
 
-// static void pigeon_skip_ws_and_eol(pigeon_parse_context_t * restrict ctx)
-// {
-//     const char * pos = ctx->msg_pos;
-//     const char * end = ctx->msg_pos + ctx->remaining;
-
-//     for (; pos != end; ++pos)
-//     {
-//         switch (*pos)
-//         {
-//             case ' ':
-//             case '\t':
-//                 break;
-
-//             case '\n':
-//                 ++ctx->line_number;
-//                 ctx->line_start = pos + 1;
-//                 break;
-//         }
-//     }
-
-//     pigeon_move_to(ctx, pos);
-// }
-
 static bool pigeon_parse_encoded_value(pigeon_parse_context_t * restrict ctx, pigeon_encoded_value_t * restrict decoded)
 {
     if (ctx->remaining == 0)
@@ -278,45 +223,6 @@ static bool pigeon_parse_encoded_value(pigeon_parse_context_t * restrict ctx, pi
 
     const char * hash_end = pigeon_scan_base64(ctx);
     decoded->hash = pigeon_strdup_range(pos, hash_end - pos);
-
-    pigeon_move_to(ctx, hash_end);
-    return true;
-}
-
-static bool pigeon_parse_encoded_value2(pigeon_parse_context_t * restrict ctx, pigeon_encoding_type_t * restrict encoding_type, pigeon_token_t * restrict hash)
-{
-    if (ctx->remaining == 0)
-        false;
-
-    const char * restrict pos = ctx->msg_pos;
-    const char * restrict end = ctx->msg_pos + ctx->remaining;
-
-    for (; pos != end; ++pos)
-    {
-        if (*pos == ':')
-        {
-            pigeon_message_size_t spec_size = pos - ctx->msg_pos;
-            if (0 == pigeon_safe_memcmp(ctx->msg_pos, spec_size, encoding_str_sha256, sizeof(encoding_str_sha256) - 1))
-                *encoding_type = PIGEON_ENCODING_TYPE_SHA256;
-            else if (0 == pigeon_safe_memcmp(ctx->msg_pos, spec_size, encoding_str_ed25519, sizeof(encoding_str_ed25519) - 1))
-                *encoding_type = PIGEON_ENCODING_TYPE_ED25519;
-            else
-                return false;
-
-            break;
-        }
-        else if (isspace(*pos) || !isprint(*pos))
-            return false;
-    }
-
-    if (pos == end)
-        return false;
-
-    pigeon_move_to(ctx, pos);
-
-    const char * hash_end = pigeon_scan_base64(ctx);
-    hash->token_start = pos;
-    hash->token_length = hash_end - pos;
 
     pigeon_move_to(ctx, hash_end);
     return true;
@@ -462,25 +368,11 @@ void pigeon_scan_bareword(pigeon_parse_context_t * restrict ctx)
     pigeon_move_to(ctx, pos);
 }
 
-// typedef struct {
-//     const char *name;
-//     size_t name_size;
-//     pigeon_field_type_t type;
-// } pigeon_header_footer_field_desc_t;
-
 static const char header_author[] = "author";
 static const char header_sequence[] = "sequence";
 static const char header_kind[] = "kind";
 static const char header_previous[] = "previous";
 static const char header_timestamp[] = "timestamp";
-
-// static const pigeon_header_footer_field_desc_t header_fields_descriptors[] = {
-//     { header_author,    sizeof(header_author),      PIGEON_FIELD_IDENTITY },
-//     { header_sequence,  sizeof(header_sequence),    PIGEON_FIELD_INT64 },
-//     { header_kind,      sizeof(header_kind),        PIGEON_FIELD_STRING },
-//     { header_previous,  sizeof(header_previous),    PIGEON_FIELD_SIGNATURE },
-//     { header_timestamp, sizeof(header_timestamp),   PIGEON_FIELD_INT64 }
-// };
 
 bool pigeon_parse_header_or_footer(pigeon_parse_context_t * restrict ctx, pigeon_field_t * restrict field)
 {
@@ -498,21 +390,6 @@ bool pigeon_parse_header_or_footer(pigeon_parse_context_t * restrict ctx, pigeon
 
 bool pigeon_parse_header(pigeon_parse_context_t * restrict ctx, pigeon_parsed_message_t * restrict decoded_msg)
 {
-
-    // for (unsigned i = 0; i < sizeof(header_fields_descriptors) / sizeof(header_fields_descriptors[0]); ++i)
-    // {
-    //     pigeon_skip_ws(ctx);
-    //     if (pigeon_is_prefix(ctx, header_fields_descriptors[i].name, header_fields_descriptors[i].name_size))
-    //     {
-    //         pigeon_advance_pos(ctx, header_fields_descriptors[i].name_size);
-    //         if (header_fields_descriptors[i].name == header_author)
-    //         {
-    //             pigeon_encoding_type_t encoding_type;
-    //             pigeon_parse_encoded_value2(ctx, )
-    //         }
-    //     }
-    // }
-
     pigeon_field_t field;
     pigeon_init_field(&field);
     if (!pigeon_parse_header_or_footer(ctx, &field))
@@ -651,16 +528,7 @@ bool pigeon_parse_message(const char * restrict msg_data, pigeon_message_size_t 
         pigeon_list_append(&decoded_msg->fields, field);
     }
 
-    // pigeon_skip_ws(&ctx);
-    // if (ctx.remaining == 0)
-    //     return false;
-
-    // while (ctx.remaining > 0)
-    // {
-
-    // }
-
-    // pigeon_parse_header(&ctx, decoded_msg);
+    if (ctx.remaining > 0)
 
     return true;
 
