@@ -34,4 +34,16 @@ static inline void * pigeon_list_next(void * elem)
 
 void pigeon_list_append(pigeon_list_t * restrict plist, void * elem);
 
+static inline void * pigeon_list_pop_head(pigeon_list_t * restrict plist)
+{
+    pigeon_list_elem_t * elem = plist->head;
+    if (elem != NULL)
+    {
+        plist->head = elem->next;
+        elem->next = NULL;
+    }
+
+    return elem;
+}
+
 #endif

@@ -73,12 +73,16 @@ typedef struct {
 
     int line_number;
     const char * line_start;
-    
-    pigeon_parsed_message_t * decoded_msg;
 } pigeon_parse_context_t;
 
 static const char encoding_str_sha256[] = "sha256:";
 static const char encoding_str_ed25519[] = "ed25519:";
+
+static void pigeon_free_encoded_value(pigeon_encoded_value_t * restrict value)
+{
+    pigeon_free(value->hash);
+    value->hash = NULL;
+}
 
 static inline void pigeon_init_field(pigeon_field_t * restrict field)
 {
@@ -110,15 +114,20 @@ static void pigeon_free_field(pigeon_field_t * restrict field)
 
 static void pigeon_free_field_list(pigeon_list_t * restrict field_list)
 {
-    pigeon_field_t * field = (pigeon_field_t *)field_list->head;
-    while (field != NULL)
+    pigeon_field_t * field;
+    while ((field = pigeon_list_pop_head(field_list)) != NULL)
     {
-        pigeon_field_t * next = pigeon_list_next(field);
         pigeon_free_field(field);
-        field = next;
+        pigeon_free(field);
     }
 
     field_list->head = field_list->tail = NULL;
+}
+
+static void pigeon_release_field_value(pigeon_field_t * restrict field)
+{
+    field->field_type = PIGEON_FIELD_EMPTY;
+    memset(&field->field_value, 0, sizeof(field->field_value));
 }
 
 static inline void pigeon_advance_pos(pigeon_parse_context_t * restrict ctx, pigeon_message_size_t count)
@@ -280,7 +289,7 @@ error:
     return false;
 }
 
-static inline pigeon_field_type_t pigeon_deduce_field_type(char ch)
+static pigeon_field_type_t pigeon_deduce_field_type(char ch)
 {
     switch (ch)
     {
@@ -385,7 +394,22 @@ bool pigeon_parse_header_or_footer(pigeon_parse_context_t * restrict ctx, pigeon
     else if (ctx->remaining == 0)
         return false;  // unexpected EOF
 
-    return pigeon_parse_field_value(ctx, field);
+    pigeon_skip_ws(ctx);
+
+    if (!pigeon_parse_field_value(ctx, field))
+        return false;
+
+    pigeon_skip_ws(ctx);
+
+    if (ctx->remaining == 0)
+        return false;   // unexpected EOF
+    else if (*ctx->msg_pos != '\n')
+        return false;   // expected newline
+
+    pigeon_advance_pos(ctx, 1);
+    ++ctx->line_number;
+
+    return true;
 }
 
 bool pigeon_parse_header(pigeon_parse_context_t * restrict ctx, pigeon_parsed_message_t * restrict decoded_msg)
@@ -398,47 +422,57 @@ bool pigeon_parse_header(pigeon_parse_context_t * restrict ctx, pigeon_parsed_me
     if (strcmp(field.field_name, header_author) == 0)
     {
         if (field.field_type == PIGEON_FIELD_IDENTITY)
+        {
             decoded_msg->author = field.field_value.encoded;
+            pigeon_release_field_value(&field);
+        }
         else
             goto error;
     }
     else if (strcmp(field.field_name, header_sequence) == 0)
     {
         if (field.field_type == PIGEON_FIELD_INT64)
+        {
             decoded_msg->sequence_number = field.field_value.int64_;
+            pigeon_release_field_value(&field);
+        }
         else
             goto error;
     }
     else if (strcmp(field.field_name, header_kind) == 0)
     {
         if (field.field_type == PIGEON_FIELD_STRING)
+        {
             decoded_msg->kind = field.field_value.string;
+            pigeon_release_field_value(&field);
+        }
         else
             goto error;
     }
     else if (strcmp(field.field_name, header_previous) == 0)
     {
         if (field.field_type == PIGEON_FIELD_SIGNATURE)
+        {
             decoded_msg->previous = field.field_value.encoded;
+            pigeon_release_field_value(&field);
+        }
         else
             goto error;
     }
     else if (strcmp(field.field_name, header_timestamp) == 0)
     {
         if (field.field_type == PIGEON_FIELD_INT64)
+        {
             decoded_msg->timestamp = field.field_value.int64_;
+            pigeon_release_field_value(&field);
+        }
         else
             goto error;
     }
     else
         goto error;
 
-    pigeon_skip_ws(ctx);
-    if (ctx->remaining != 0 && *ctx->msg_pos == '\n')
-    {
-        pigeon_advance_pos(ctx, 1);
-        ++ctx->line_number;
-    }
+    pigeon_free_field(&field);
 
     return true;
 
@@ -447,7 +481,7 @@ error:
     return false;
 }
 
-bool pigeon_parse_data_field(pigeon_parse_context_t * restrict ctx, pigeon_field_t * restrict field)
+static bool pigeon_parse_data_field(pigeon_parse_context_t * restrict ctx, pigeon_field_t * restrict field)
 {
     if (!pigeon_parse_string(ctx, &field->field_name))
         return false;
@@ -465,13 +499,64 @@ bool pigeon_parse_data_field(pigeon_parse_context_t * restrict ctx, pigeon_field
     if (!pigeon_parse_field_value(ctx, field))
         return false;
 
-    if (ctx->remaining != 0 && *ctx->msg_pos == '\n')
+    pigeon_skip_ws(ctx);
+
+    if (ctx->remaining == 0)
+        return false;   // unexpected EOF
+    else if (*ctx->msg_pos != '\n')
+        return false;   // expected newline
+
+    pigeon_advance_pos(ctx, 1);
+    ++ctx->line_number;
+
+    return true;
+}
+
+bool pigeon_parse_data_fields(pigeon_parse_context_t * restrict ctx, pigeon_list_t * restrict fields)
+{
+    while (ctx->remaining > 0)
     {
-        pigeon_advance_pos(ctx, 1);
-        ++ctx->line_number;
+        pigeon_skip_ws(ctx);
+        if (*ctx->msg_pos == '\n')
+            break;
+
+        pigeon_field_t * field = malloc(sizeof(pigeon_field_t));
+        if (!field)
+            return false; // allocation failure
+
+        pigeon_init_field(field);
+        if (!pigeon_parse_data_field(ctx, field))
+        {
+            pigeon_free_field(field);
+            pigeon_free(field);
+            return false;
+        }
+
+        pigeon_list_append(fields, field);
     }
 
     return true;
+}
+
+bool pigeon_parse_footer(pigeon_parse_context_t * restrict ctx, pigeon_parsed_message_t * restrict decoded_msg)
+{
+    pigeon_field_t field;
+    pigeon_init_field(&field);
+    if (!pigeon_parse_header_or_footer(ctx, &field))
+        goto error;
+    else if (0 != strcmp(field.field_name, "signature"))
+        goto error;     // invalid footer field
+    else if (field.field_type != PIGEON_FIELD_SIGNATURE)
+        goto error;     // signature must be SIGNATURE type
+
+    decoded_msg->signature = field.field_value.encoded;
+    pigeon_release_field_value(&field);
+    pigeon_free_field(&field);
+    return true;
+    
+error:
+    pigeon_free_field(&field);
+    return false;
 }
 
 bool pigeon_parse_message(const char * restrict msg_data, pigeon_message_size_t msg_size, pigeon_parsed_message_t * restrict decoded_msg)
@@ -500,41 +585,45 @@ bool pigeon_parse_message(const char * restrict msg_data, pigeon_message_size_t 
     else if (*ctx.msg_pos != '\n')
         goto error; // expected blank line
 
+    ++ctx.line_number;
     pigeon_advance_pos(&ctx, 1);
 
     if (ctx.remaining == 0)
         goto error; // unexpected EOF
     
     pigeon_list_init(&decoded_msg->fields);
+    if (!pigeon_parse_data_fields(&ctx, &decoded_msg->fields))
+        goto error;
 
-    while (ctx.remaining > 0)
-    {
-        pigeon_skip_ws(&ctx);
-        if (*ctx.msg_pos == '\n')
-            break;
+    if (ctx.remaining == 0)
+        goto error; // unexpected EOF
+    else if (*ctx.msg_pos != '\n')
+        goto error; // expected blank line
 
-        pigeon_field_t * field = malloc(sizeof(pigeon_field_t));
-        if (!field)
-            goto error; // allocation failure
+    ++ctx.line_number;
+    pigeon_advance_pos(&ctx, 1);
 
-        pigeon_init_field(field);
-        if (!pigeon_parse_data_field(&ctx, field))
-        {
-            pigeon_free_field(field);
-            pigeon_free(field);
-            goto error;
-        }
-
-        pigeon_list_append(&decoded_msg->fields, field);
-    }
+    if (!pigeon_parse_footer(&ctx, decoded_msg))
+        goto error;
 
     if (ctx.remaining > 0)
+        goto error;  // extra data at end
 
     return true;
 
 error:
     // TODO: free decoded_msg
     return false;
+}
+
+void pigeon_free_parsed_message(pigeon_parsed_message_t * restrict msg)
+{
+    pigeon_free_encoded_value(&msg->author);
+    pigeon_free(msg->kind);
+    msg->kind = NULL;
+    pigeon_free_encoded_value(&msg->previous);
+    pigeon_free_encoded_value(&msg->signature);
+    pigeon_free_field_list(&msg->fields);
 }
 
 static const char test_message[] = 
@@ -545,11 +634,12 @@ static const char test_message[] =
     "timestamp 23123123123\n"
     "\n"
     "\"foo\": &sha256:3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea\n"
-    "\"baz\":\"bar\""
-    "\"my_friend\":@ed25519:abcdef1234567890"
-    "\"really_cool_message\":%sha256:85738f8f9a7f1b04b5329c590ebcb9e425925c6d0984089c43a022de4f19c281"
-    "\"baz\":\"whatever\""
-    "\n";
+    "\"baz\":\"bar\"\n"
+    "\"my_friend\":@ed25519:abcdef1234567890\n"
+    "\"really_cool_message\":%sha256:85738f8f9a7f1b04b5329c590ebcb9e425925c6d0984089c43a022de4f19c281\n"
+    "\"baz\":\"whatever\"\n"
+    "\n"
+    "signature %ed25519:1b04b5329c1b04b5329c1b04b5329c1b04b5329c\n";
 
 static const char* format_encoded_value(const pigeon_encoded_value_t * restrict value)
 {
@@ -608,7 +698,12 @@ int main(void)
                 break;
         }
     }
-    
 
+    puts("\n==== FOOTER ====");
+    printf("signature: %s\n", format_encoded_value(&message.signature));
+    
+    fflush(stdout);
+
+    pigeon_free_parsed_message(&message);
     return 0;
 }
