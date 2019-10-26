@@ -1,90 +1,18 @@
 
+#include "pigeon_parser.h"
+#include "pigeon_string.h"
+#include "pigeon_memory.h"
+#include "pigeon_list.h"
+
 #include <stdio.h>
 #include <ctype.h>
-#include <stdint.h>
 #include <stdbool.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdarg.h>
 
-#include "pigeon_string.h"
-#include "pigeon_memory.h"
-#include "pigeon_list.h"
-
-typedef int32_t pigeon_sequence_number_t;
-typedef int64_t pigeon_timestamp_t;
-
-typedef int32_t pigeon_message_size_t;
-
-typedef struct {
-    const char * token_start;
-    pigeon_message_size_t token_length;
-} pigeon_token_t;
-
-typedef enum {
-    PIGEON_ENCODING_TYPE_SHA256,
-    PIGEON_ENCODING_TYPE_ED25519
-} pigeon_encoding_type_t;
-
-typedef struct {
-    pigeon_encoding_type_t encoding_type;
-    char * hash;
-} pigeon_encoded_value_t;
-
-typedef enum {
-    PIGEON_FIELD_EMPTY,
-    PIGEON_FIELD_STRING,
-    PIGEON_FIELD_INT64,
-    PIGEON_FIELD_IDENTITY,
-    PIGEON_FIELD_SIGNATURE,
-    PIGEON_FIELD_BLOB
-} pigeon_field_type_t;
-
-#define PIGEON_MAX_INTRINSIC_FIELD_NAME_LENGTH 20
-
-typedef struct {
-    pigeon_list_elem_t elem;
-
-    char * field_name;
-    pigeon_field_type_t field_type;
-
-    union {
-        pigeon_encoded_value_t encoded;
-        char * string;
-        int64_t int64_;
-    } field_value;
-} pigeon_field_t;
-
-typedef struct {
-    pigeon_encoded_value_t author;
-    pigeon_sequence_number_t sequence_number;
-    char * kind;
-    pigeon_encoded_value_t previous;
-    pigeon_timestamp_t timestamp;
-    pigeon_encoded_value_t signature;
-
-    pigeon_list_t fields;
-} pigeon_parsed_message_t;
-
-typedef struct {
-    const char * msg_data;
-    const char * msg_pos;
-    pigeon_message_size_t msg_size;
-    pigeon_message_size_t remaining;
-
-    unsigned line_number;
-    const char * line_start;
-
-    char error_messages[256];
-} pigeon_parse_context_t;
-
 static const char encoding_str_sha256[] = "sha256";
 static const char encoding_str_ed25519[] = "ed25519";
-
-const char * pigeon_get_error_messages(const pigeon_parse_context_t * restrict ctx)
-{
-    return ctx->error_messages;
-}
 
 static void pigeon_parse_error(pigeon_parse_context_t * restrict ctx, const char * format, ...)
 {
@@ -259,7 +187,7 @@ static bool pigeon_parse_encoded_value(pigeon_parse_context_t * restrict ctx, pi
 
     if (ctx->remaining == 0)
     {
-        pigeon_parse_error(ctx, "unexpected EOF");
+        pigeon_parse_error(ctx, "EOF encountered when ':' expected");
         return false;
     }
     else if (*ctx->msg_pos != ':')
@@ -283,7 +211,10 @@ static bool pigeon_parse_encoded_value(pigeon_parse_context_t * restrict ctx, pi
     pigeon_skip_ws(ctx);
 
     if (ctx->remaining == 0)
+    {
+        pigeon_parse_error(ctx, "EOF encountered when expecting encoded hash value");
         return false;
+    }
 
     pos = ctx->msg_pos;
     const char * hash_end = pigeon_scan_base64(ctx);
@@ -295,16 +226,20 @@ static bool pigeon_parse_encoded_value(pigeon_parse_context_t * restrict ctx, pi
 
 static bool pigeon_parse_string(pigeon_parse_context_t * restrict ctx, char ** restrict str)
 {
-    if (ctx->remaining < 2)
+    if (ctx->remaining == 0)
+    {
+        pigeon_parse_error(ctx, "EOF encountered when expecting string");
         return false;
-    else if (*ctx->msg_pos != '"')
-        return false;
+    }
 
     pigeon_advance_pos(ctx, 1);
 
     pigeon_string_t tmp_str;
     if (!pigeon_string_init(&tmp_str))
+    {
+        pigeon_parse_error(ctx, "memory allocation failed");
         return false;
+    }
 
     const char * pos = ctx->msg_pos;
     const char * end = ctx->msg_pos + ctx->remaining;
@@ -322,18 +257,33 @@ static bool pigeon_parse_string(pigeon_parse_context_t * restrict ctx, char ** r
                 if (*pos == '"')
                     pigeon_string_append_ch(&tmp_str, '"');
                 else
+                {
+                    char seq[3] = { '\\', *pos, '\0' };
+                    pigeon_parse_error(ctx, "unsupported escape sequence ('%s') in string", seq);
                     goto error;
+                }
             }
             else
+            {
+                pigeon_parse_error(ctx, "EOF encountered while in string literal");
                 goto error;
+            }
         }
         else if (isprint(*pos))
         {
             pigeon_string_append_ch(&tmp_str, *pos);
             ++pos;
         }
-        else
+        else if (*pos == '\n')
+        {
+            pigeon_parse_error(ctx, "expected '\"' marker before end of line");
             goto error;
+        }
+        else
+        {
+            pigeon_parse_error(ctx, "invalid character 0x%ux encountered in string", *pos);
+            goto error;
+        }
     }
 
     *str = pigeon_string_release(&tmp_str);
@@ -361,7 +311,10 @@ static pigeon_field_type_t pigeon_deduce_field_type(char ch)
 static bool pigeon_parse_field_value(pigeon_parse_context_t * restrict ctx, pigeon_field_t * restrict field)
 {
     if (ctx->remaining == 0)
+    {
+        pigeon_parse_error(ctx, "EOF encountered when expecting field value");
         return false;
+    }
 
     char ch = *ctx->msg_pos;
     switch (ch)
@@ -382,45 +335,46 @@ static bool pigeon_parse_field_value(pigeon_parse_context_t * restrict ctx, pige
             break;
     }
 
-    if (isdigit(*ctx->msg_pos))
+    if (!isdigit(*ctx->msg_pos))
     {
-        field->field_type = PIGEON_FIELD_INT64;
+        pigeon_parse_error(ctx, "invalid character '%c' in field value", *ctx->msg_pos);
+        return false;
+    }
+    
+    field->field_type = PIGEON_FIELD_INT64;
 
-        char number[64];
-        unsigned length = 0;
+    char number[64];
+    unsigned length = 0;
 
-        const char * pos = ctx->msg_pos;
-        const char * end = ctx->msg_pos + ctx->remaining;
+    const char * pos = ctx->msg_pos;
+    const char * end = ctx->msg_pos + ctx->remaining;
 
-        for (; pos != end && length < sizeof(number); ++pos)
-        {
-            if (isdigit(*pos) || *pos == '-')
-                number[length++] = *pos;
-            else
-                break;
-        }
-
-        if (length == sizeof(number))
-        {
-            // Number was too large
-            return false;
-        }
-
-        number[length] = '\0';
-
-        const char* endp;
-        field->field_value.int64_ = strtol(number, (char**)&endp, 10);
-        if (*endp != '\0')
-        {
-            // Invalid number
-            return false;
-        }
-
-        pigeon_move_to(ctx, pos);
-        return true;
+    for (; pos != end && length < sizeof(number) - 1; ++pos)
+    {
+        if (isdigit(*pos) || *pos == '-')
+            number[length++] = *pos;
+        else
+            break;
     }
 
-    return false;
+    if (length == sizeof(number))
+    {
+        pigeon_parse_error(ctx, "length of integer literal exceeds limit (%u)", (unsigned)(sizeof(number) - 1));
+        return false;
+    }
+
+    number[length] = '\0';
+
+    const char* endp;
+    field->field_value.int64_ = strtol(number, (char**)&endp, 10);
+    if (*endp != '\0')
+    {
+        pigeon_parse_error(ctx, "invalid integer literal '%s'", number);
+        return false;
+    }
+
+    pigeon_move_to(ctx, pos);
+    return true;
 }
 
 void pigeon_scan_bareword(pigeon_parse_context_t * restrict ctx)
@@ -448,9 +402,15 @@ bool pigeon_parse_header_or_footer(pigeon_parse_context_t * restrict ctx, pigeon
     field->field_name = pigeon_strdup_range(field_name_start, ctx->msg_pos - field_name_start);
 
     if (0 == pigeon_skip_ws(ctx))
-        return false;  // No whitespace
+    {
+        pigeon_parse_error(ctx, "invalid character '%c' in field name", *ctx->msg_pos);
+        return false;
+    }
     else if (ctx->remaining == 0)
-        return false;  // unexpected EOF
+    {
+        pigeon_parse_error(ctx, "EOF encountered when header/footer field expected");
+        return false;
+    }
 
     pigeon_skip_ws(ctx);
 
@@ -460,9 +420,15 @@ bool pigeon_parse_header_or_footer(pigeon_parse_context_t * restrict ctx, pigeon
     pigeon_skip_ws(ctx);
 
     if (ctx->remaining == 0)
-        return false;   // unexpected EOF
+    {
+        pigeon_parse_error(ctx, "EOF encountered when end of line expected");
+        return false;
+    }
     else if (*ctx->msg_pos != '\n')
-        return false;   // expected newline
+    {
+        pigeon_parse_error(ctx, "invalid character '%c' encountered instead of end of line", *ctx->msg_pos);
+        return false;
+    }
 
     pigeon_advance_pos(ctx, 1);
     ++ctx->line_number;
@@ -485,7 +451,10 @@ bool pigeon_parse_header(pigeon_parse_context_t * restrict ctx, pigeon_parsed_me
             pigeon_release_field_value(&field);
         }
         else
+        {
+            pigeon_parse_error(ctx, "author header requires IDENTITY value type");
             goto error;
+        }
     }
     else if (strcmp(field.field_name, header_sequence) == 0)
     {
@@ -495,7 +464,10 @@ bool pigeon_parse_header(pigeon_parse_context_t * restrict ctx, pigeon_parsed_me
             pigeon_release_field_value(&field);
         }
         else
+        {
+            pigeon_parse_error(ctx, "sequence header requires INT64 value type");
             goto error;
+        }
     }
     else if (strcmp(field.field_name, header_kind) == 0)
     {
@@ -505,7 +477,10 @@ bool pigeon_parse_header(pigeon_parse_context_t * restrict ctx, pigeon_parsed_me
             pigeon_release_field_value(&field);
         }
         else
+        {
+            pigeon_parse_error(ctx, "kind header requires STRING value type");
             goto error;
+        }
     }
     else if (strcmp(field.field_name, header_previous) == 0)
     {
@@ -515,7 +490,10 @@ bool pigeon_parse_header(pigeon_parse_context_t * restrict ctx, pigeon_parsed_me
             pigeon_release_field_value(&field);
         }
         else
+        {
+            pigeon_parse_error(ctx, "previous header requires SIGNATURE value type");
             goto error;
+        }
     }
     else if (strcmp(field.field_name, header_timestamp) == 0)
     {
@@ -525,13 +503,15 @@ bool pigeon_parse_header(pigeon_parse_context_t * restrict ctx, pigeon_parsed_me
             pigeon_release_field_value(&field);
         }
         else
+        {
+            pigeon_parse_error(ctx, "timestamp header requires INT64 value type");
             goto error;
+        }
     }
     else
         goto error;
 
     pigeon_free_field(&field);
-
     return true;
 
 error:
@@ -547,9 +527,15 @@ static bool pigeon_parse_data_field(pigeon_parse_context_t * restrict ctx, pigeo
     pigeon_skip_ws(ctx);
 
     if (ctx->remaining == 0)
-        return false;     // unexpected EOF
+    {
+        pigeon_parse_error(ctx, "EOF encountered when data field or newline expected");
+        return false;
+    }
     else if (*ctx->msg_pos != ':')
-        return false;     // expected ':'
+    {
+        pigeon_parse_error(ctx, "expeted ':' after data field name");
+        return false;
+    }
 
     pigeon_advance_pos(ctx, 1);
     pigeon_skip_ws(ctx);
@@ -560,9 +546,15 @@ static bool pigeon_parse_data_field(pigeon_parse_context_t * restrict ctx, pigeo
     pigeon_skip_ws(ctx);
 
     if (ctx->remaining == 0)
-        return false;   // unexpected EOF
+    {
+        pigeon_parse_error(ctx, "EOF encountered when end of line expected");
+        return false;
+    }
     else if (*ctx->msg_pos != '\n')
-        return false;   // expected newline
+    {
+        pigeon_parse_error(ctx, "invalid character '%c' encountered instead of end of line", *ctx->msg_pos);
+        return false;
+    }
 
     pigeon_advance_pos(ctx, 1);
     ++ctx->line_number;
@@ -580,7 +572,10 @@ bool pigeon_parse_data_fields(pigeon_parse_context_t * restrict ctx, pigeon_list
 
         pigeon_field_t * field = malloc(sizeof(pigeon_field_t));
         if (!field)
-            return false; // allocation failure
+        {
+            pigeon_parse_error(ctx, "memory allocation failed");
+            return false;
+        }
 
         pigeon_init_field(field);
         if (!pigeon_parse_data_field(ctx, field))
@@ -603,9 +598,15 @@ bool pigeon_parse_footer(pigeon_parse_context_t * restrict ctx, pigeon_parsed_me
     if (!pigeon_parse_header_or_footer(ctx, &field))
         goto error;
     else if (0 != strcmp(field.field_name, "signature"))
-        goto error;     // invalid footer field
+    {
+        pigeon_parse_error(ctx, "invalid footer field name '%s'", field.field_name);
+        goto error;
+    }
     else if (field.field_type != PIGEON_FIELD_SIGNATURE)
-        goto error;     // signature must be SIGNATURE type
+    {
+        pigeon_parse_error(ctx, "signature footer requires SIGNATURE value type");
+        goto error;
+    }
 
     decoded_msg->signature = field.field_value.encoded;
     pigeon_release_field_value(&field);
@@ -654,9 +655,16 @@ bool pigeon_parse_message(pigeon_parse_context_t * restrict ctx, const char * re
         goto error;
 
     if (ctx->remaining == 0)
-        goto error; // unexpected EOF
+    {
+        pigeon_parse_error(ctx, "EOF encountered before footer");
+        return false;
+    }
     else if (*ctx->msg_pos != '\n')
-        goto error; // expected blank line
+    {
+        // shouldn't be able to get here without a new line present
+        pigeon_parse_error(ctx, "internal parser error occurred");
+        return false;
+    }
 
     ++ctx->line_number;
     pigeon_advance_pos(ctx, 1);
@@ -665,7 +673,10 @@ bool pigeon_parse_message(pigeon_parse_context_t * restrict ctx, const char * re
         goto error;
 
     if (ctx->remaining > 0)
+    {
+        pigeon_parse_error(ctx, "extra characters found when expected EOF");
         goto error;  // extra data at end
+    }
 
     return true;
 
@@ -682,91 +693,4 @@ void pigeon_free_parsed_message(pigeon_parsed_message_t * restrict msg)
     pigeon_free_encoded_value(&msg->previous);
     pigeon_free_encoded_value(&msg->signature);
     pigeon_free_field_list(&msg->fields);
-}
-
-static const char test_message[] = 
-    "author @ed25519:ajgdylxeifojlxpbmen3exlnsbx8buspsjh37b/ipvi=\n"
-    "sequence 23\n"
-    "kind \"example\"\n"
-    "previous %sha256:85738f8f9a7f1b04b5329c590ebcb9e425925c6d0984089c43a022de4f19c281\n"
-    "timestamp 23123123123\n"
-    "\n"
-    "\"foo\": &sha256:3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea\n"
-    "\"baz\":\"bar\"\n"
-    "\"my_friend\":@ed25519:abcdef1234567890\n"
-    "\"really_cool_message\":%sha256:85738f8f9a7f1b04b5329c590ebcb9e425925c6d0984089c43a022de4f19c281\n"
-    "\"baz\":\"whatever\"\n"
-    "\n"
-    "signature %ed25519:1b04b5329c1b04b5329c1b04b5329c1b04b5329c\n";
-
-static const char* format_encoded_value(const pigeon_encoded_value_t * restrict value)
-{
-    static char buffer[256];
-
-    const char * type = "(unknown)";
-    switch (value->encoding_type)
-    {
-        case PIGEON_ENCODING_TYPE_ED25519: type = "ED25519"; break;
-        case PIGEON_ENCODING_TYPE_SHA256: type = "SHA256"; break;
-    }
-
-    snprintf(buffer, sizeof(buffer), "%s (%s)", value->hash, type);
-    return buffer;
-}
-
-int main(void)
-{
-    pigeon_parse_context_t ctx;
-    pigeon_parsed_message_t message;
-    if (!pigeon_parse_message(&ctx, test_message, sizeof(test_message) - 1, &message))
-    {
-        const char * msgs = pigeon_get_error_messages(&ctx);
-        if (*msgs)
-            puts(msgs);
-        else
-            puts("Parsing failed\n");
-        return 1;
-    }
-
-    puts("==== HEADER ====");
-    printf("author: %s\n", format_encoded_value(&message.author));
-    printf("sequence: %u\n", message.sequence_number);
-    printf("kind: %s\n", message.kind);
-    printf("previous: %s\n", format_encoded_value(&message.previous));
-    printf("timestamp: %ld\n", message.timestamp);
-
-    puts("\n==== DATA FIELDS ====");
-    pigeon_field_t * field = pigeon_list_head(&message.fields);
-    for (; field != NULL; field = pigeon_list_next(field))
-    {
-        printf("%s = ", field->field_name);
-        switch (field->field_type)
-        {
-            case PIGEON_FIELD_IDENTITY:
-            case PIGEON_FIELD_BLOB:
-            case PIGEON_FIELD_SIGNATURE:
-                printf("%s\n", format_encoded_value(&field->field_value.encoded));
-                break;
-
-            case PIGEON_FIELD_INT64:
-                printf("%ld\n", field->field_value.int64_);
-                break;
-
-            case PIGEON_FIELD_STRING:
-                printf("[%s]\n", field->field_value.string);
-                break;
-
-            default:
-                puts("(error)\n");
-                break;
-        }
-    }
-
-    puts("\n==== FOOTER ====");
-    printf("signature: %s\n", format_encoded_value(&message.signature));
-    
-    fflush(stdout);
-
-    pigeon_free_parsed_message(&message);
-    return 0;
 }
