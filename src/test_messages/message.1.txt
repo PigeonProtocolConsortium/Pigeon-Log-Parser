@@ -1,0 +1,13 @@
+author @ed25519:ajgdylxeifojlxpbmen3exlnsbx8buspsjh37b/ipvi=
+sequence 23
+kind "example"
+previous %sha256:85738f8f9a7f1b04b5329c590ebcb9e425925c6d0984089c43a022de4f19c281
+timestamp 23123123123
+
+"foo": &sha256:3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea
+"baz":"bar"
+"my_friend":@ed25519:abcdef1234567890
+"really_cool_message":%sha256:85738f8f9a7f1b04b5329c590ebcb9e425925c6d0984089c43a022de4f19c281
+"baz":"whatever"
+
+signature %ed25519:1b04b5329c1b04b5329c1b04b5329c1b04b5329c

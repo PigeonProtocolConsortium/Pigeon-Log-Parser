@@ -2,21 +2,6 @@
 
 #include <stdio.h>
 
-static const char test_message[] = 
-    "author @ed25519:ajgdylxeifojlxpbmen3exlnsbx8buspsjh37b/ipvi=\n"
-    "sequence 23\n"
-    "kind \"example\"\n"
-    "previous %sha256:85738f8f9a7f1b04b5329c590ebcb9e425925c6d0984089c43a022de4f19c281\n"
-    "timestamp 23123123123\n"
-    "\n"
-    "\"foo\": &sha256:3f79bb7b435b05321651daefd374cdc681dc06faa65e374e38337b88ca046dea\n"
-    "\"baz\":\"bar\"\n"
-    "\"my_friend\":@ed25519:abcdef1234567890\n"
-    "\"really_cool_message\":%sha256:85738f8f9a7f1b04b5329c590ebcb9e425925c6d0984089c43a022de4f19c281\n"
-    "\"baz\":\"whatever\"\n"
-    "\n"
-    "signature %ed25519:1b04b5329c1b04b5329c1b04b5329c1b04b5329c\n";
-
 static const char* format_encoded_value(const pigeon_encoded_value_t * restrict value)
 {
     static char buffer[256];
@@ -34,16 +19,30 @@ static const char* format_encoded_value(const pigeon_encoded_value_t * restrict 
 
 int main(void)
 {
+    int rc = 0;
+    
+    char buffer[10240];
+
+    size_t input_size = fread(buffer, 1, sizeof(buffer), stdin);
+    if (input_size == 0)
+    {
+        fputs("Error: no input!\n", stderr);
+        return 1;
+    }
+
     pigeon_parse_context_t ctx;
     pigeon_parsed_message_t message;
-    if (!pigeon_parse_message(&ctx, test_message, sizeof(test_message) - 1, &message))
+    bool parse_success = pigeon_parse_message(&ctx, buffer, input_size, &message);
+
+    if (!parse_success)
     {
         const char * msgs = pigeon_get_error_messages(&ctx);
         if (*msgs)
             puts(msgs);
         else
             puts("Parsing failed\n");
-        return 1;
+
+        return 1;        
     }
 
     puts("==== HEADER ====");
