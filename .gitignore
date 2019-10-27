@@ -1,9 +1,9 @@
-src/parser_test
 .vscode/launch.json
 .vscode/settings.json
 .vscode/tasks.json
-src/CMakeFiles
-src/Makefile
-src/CMakeCache.txt
 src/cmake_install.cmake
+src/CMakeCache.txt
+src/CMakeFiles
 src/libpigeon_parser.a
+src/Makefile
+src/parser_test
